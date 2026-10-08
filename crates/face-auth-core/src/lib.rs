@@ -32,39 +32,17 @@ impl FaceAuth {
         Ok(Self { config, encoder, detector })
     }
 
+    /// Single-shot auth used by the GUI "Test" button.
+    ///
+    /// It is really a short scan: the camera is opened once and kept streaming
+    /// for `scan_duration_ms`, because the sensor emits alternating dark/lit
+    /// frames (IR strobe) and the first frames after STREAMON are always dark.
+    /// Grabbing exactly one frame — as this used to do — reliably grabbed a
+    /// dark one, so the test failed no matter where you looked.
     pub fn authenticate_once(&mut self, user: &str) -> Result<bool> {
-        let t0 = Instant::now();
-        let store = EmbeddingStore::load(user, &self.config.embeddings_dir())?;
-        eprintln!("TIMING store_load: {:?}", t0.elapsed());
-
-        let t1 = Instant::now();
-        let frame = crate::capture::capture_ir_frame(&self.config.device(), self.config.capture_timeout_ms())?;
-        eprintln!("TIMING capture: {:?}", t1.elapsed());
-
-        if !crate::detector::raw_frame_has_content(&frame) {
-            return Err(crate::error::FaceAuthError::NoFaceDetected.into());
-        }
-
-        let t2 = Instant::now();
-        let mut frame = frame;
-        crate::preprocess::histogram_equalize(&mut frame);
-        eprintln!("TIMING equalize: {:?}", t2.elapsed());
-
-        let t_detect = Instant::now();
-        if !self.detector.detect(&frame)? {
-            return Err(crate::error::FaceAuthError::NoFaceDetected.into());
-        }
-        eprintln!("TIMING detect: {:?}", t_detect.elapsed());
-
-        let t3 = Instant::now();
-        let input = crate::preprocess::preprocess_ir_frame(&frame)?;
-        eprintln!("TIMING preprocess: {:?}", t3.elapsed());
-
-        let t4 = Instant::now();
-        let embedding = self.encoder.encode(input.view())?;
-        eprintln!("TIMING encode: {:?}", t4.elapsed());
-
-        verify_embedding(&embedding, &store, self.config.threshold())
+        let duration = self.config.scan_duration_ms();
+        let interval = self.config.scan_interval_ms();
+        self.authenticate_scan(user, duration, interval)
     }
 
     pub fn authenticate_scan(
@@ -83,12 +61,20 @@ impl FaceAuth {
 
         let deadline = Instant::now() + Duration::from_millis(duration_ms);
         let mut frame_num: usize = 0;
+        let mut content_frames: usize = 0;
         let mut consecutive_errors = 0u32;
 
         loop {
             if Instant::now() >= deadline {
-                eprintln!("SCAN: window elapsed ({} frames)", frame_num);
-                return Ok(false);
+                eprintln!(
+                    "SCAN: window elapsed ({} frames, {} with content)",
+                    frame_num, content_frames
+                );
+                return if content_frames > 0 {
+                    Ok(false)
+                } else {
+                    Err(crate::error::FaceAuthError::NoFaceDetected.into())
+                };
             }
 
             frame_num += 1;
@@ -112,27 +98,31 @@ impl FaceAuth {
             };
             eprintln!("TIMING frame_{} capture: {:?}", frame_num, t_cap.elapsed());
 
+            // Dark frame: the sensor strobes the IR emitter, so every other
+            // frame is black by design. Its lit twin is next in the queue —
+            // grab it immediately instead of waiting out the scan interval.
             if !crate::detector::raw_frame_has_content(&frame) {
-                let sleep = Duration::from_millis(interval_ms)
-                    .min(deadline.saturating_duration_since(Instant::now()));
-                std::thread::sleep(sleep);
                 continue;
             }
+            content_frames += 1;
 
             let t2 = Instant::now();
             let mut frame = frame;
             crate::preprocess::histogram_equalize(&mut frame);
             eprintln!("TIMING frame_{} equalize: {:?}", frame_num, t2.elapsed());
 
-            if !self.detector.detect(&frame)? {
-                let sleep = Duration::from_millis(interval_ms)
-                    .min(deadline.saturating_duration_since(Instant::now()));
-                std::thread::sleep(sleep);
-                continue;
-            }
+            let face = match self.detector.detect_face(&frame)? {
+                Some(f) => f,
+                None => {
+                    let sleep = Duration::from_millis(interval_ms)
+                        .min(deadline.saturating_duration_since(Instant::now()));
+                    std::thread::sleep(sleep);
+                    continue;
+                }
+            };
 
             let t3 = Instant::now();
-            let input = crate::preprocess::preprocess_ir_frame(&frame)?;
+            let input = crate::preprocess::preprocess_ir_frame(&frame, Some(&face.1))?;
             let embedding = self.encoder.encode(input.view())?;
             eprintln!("TIMING frame_{} encode: {:?}", frame_num, t3.elapsed());
 
@@ -167,21 +157,24 @@ impl FaceAuth {
             attempts += 1;
 
             if !crate::detector::raw_frame_has_content(&frame) {
+                // Strobe frame — the lit twin is next in the queue, take it now.
                 eprintln!("No content in frame, retrying...");
-                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
                 continue;
             }
 
             let mut frame = frame;
             crate::preprocess::histogram_equalize(&mut frame);
 
-            if !self.detector.detect(&frame)? {
-                eprintln!("No face detected, retrying...");
-                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
-                continue;
-            }
+            let face = match self.detector.detect_face(&frame)? {
+                Some(f) => f,
+                None => {
+                    eprintln!("No face detected, retrying...");
+                    std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+                    continue;
+                }
+            };
 
-            let input = crate::preprocess::preprocess_ir_frame(&frame)?;
+            let input = crate::preprocess::preprocess_ir_frame(&frame, Some(&face.1))?;
             let embedding = self.encoder.encode(input.view())?;
             store.add_embedding(embedding);
             captured += 1;

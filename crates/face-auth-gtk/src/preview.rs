@@ -4,10 +4,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use face_auth_core::capture::{capture_ir_frame, IrFrame};
+use face_auth_core::capture::{Camera, IrFrame};
 use face_auth_core::detector::{raw_frame_has_content, FaceDetector};
-use face_auth_core::inference::FaceEncoder;
-use face_auth_core::preprocess::{histogram_equalize, preprocess_ir_frame};
+use face_auth_core::preprocess::histogram_equalize;
 
 #[derive(Clone)]
 pub struct PreviewFrame {
@@ -67,49 +66,75 @@ impl CaptureController {
         let capture_timeout = self.capture_timeout;
 
         self.thread = Some(thread::spawn(move || {
-            let mut encoder = match FaceEncoder::new(&model_path) {
-                Ok(e) => e,
-                Err(_) => return,
-            };
+            let _ = &model_path;
             let mut detector = match FaceDetector::new(&detector_model, detector_threshold) {
                 Ok(d) => d,
                 Err(_) => return,
             };
+
+            // The camera is opened once and left streaming, the way GNOME
+            // Camera/GStreamer does it. Re-opening per frame (what this used
+            // to do) always captured the first frame after STREAMON, and that
+            // one is always black: the IR emitter needs a beat to come up and
+            // the sensor alternates dark/lit frames — hence a black preview.
+            let mut camera: Option<Camera> = None;
+            let mut errors = 0u32;
+            let mut frame_idx: u32 = 0;
+            let mut face_detected = false;
 
             loop {
                 if shutdown.load(Ordering::Relaxed) {
                     break;
                 }
 
-                let frame = match capture_ir_frame(&device, capture_timeout) {
-                    Ok(f) => f,
-                    Err(_) => {
+                if camera.is_none() {
+                    match Camera::open(&device) {
+                        Ok(c) => {
+                            camera = Some(c);
+                            errors = 0;
+                        }
+                        Err(e) => {
+                            eprintln!("preview: {}", e);
+                            thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
+                    }
+                }
+
+                let frame = match camera.as_mut().unwrap().capture_frame(capture_timeout) {
+                    Ok(f) => {
+                        errors = 0;
+                        f
+                    }
+                    Err(e) => {
+                        errors += 1;
+                        eprintln!("preview: capture error — {}", e);
+                        if errors >= 3 {
+                            camera = None;
+                        }
                         thread::sleep(Duration::from_millis(100));
                         continue;
                     }
                 };
 
+                // Dark strobe frame: its lit twin is already queued, take it.
                 if !raw_frame_has_content(&frame) {
-                    send_preview(&tx, &frame, false);
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(Duration::from_millis(20));
                     continue;
                 }
 
                 let mut frame = frame;
                 histogram_equalize(&mut frame);
 
-                let face_detected = match detector.detect(&frame) {
-                    Ok(true) => {
-                        match preprocess_ir_frame(&frame) {
-                            Ok(input) => match encoder.encode(input.view()) {
-                                Ok(_) => true,
-                                Err(_) => false,
-                            },
-                            Err(_) => false,
-                        }
-                    }
-                    _ => false,
-                };
+                // Detection only: the preview indicator means "a face is in
+                // view", so encoding the frame here bought nothing and doubled
+                // the per-frame cost. It is also the expensive part (~100ms of
+                // tract inference), so it runs on every third frame to keep the
+                // preview near the sensor's own frame rate.
+                frame_idx = frame_idx.wrapping_add(1);
+                if frame_idx % 3 == 1 {
+                    face_detected = detector.detect(&frame).unwrap_or(false);
+                }
 
                 send_preview(&tx, &frame, face_detected);
                 thread::sleep(Duration::from_millis(50));

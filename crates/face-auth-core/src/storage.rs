@@ -4,7 +4,10 @@ use std::io::{BufReader, BufWriter, Write};
 use std::path::Path;
 use crate::error::FaceAuthError;
 
-const EMBEDDING_VERSION: u32 = 1;
+// v2: embeddings are computed from the detector's face crop (v1 resized the
+// whole frame). The two spaces are incompatible (~0.1 cosine between them),
+// so bumping the version rejects stale files instead of silently mixing them.
+const EMBEDDING_VERSION: u32 = 2;
 const EMBEDDING_DIM: u32 = 512;
 
 #[derive(Debug, Clone)]

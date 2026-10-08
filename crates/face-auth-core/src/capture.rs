@@ -82,16 +82,34 @@ struct v4l2_buffer {
     reserved: u32,
 }
 
+#[derive(Clone)]
 pub struct IrFrame {
     pub data: Vec<u16>,
     pub width: u32,
     pub height: u32,
+    pub sequence: u32,
+}
+
+/// Number of mmap buffers kept queued, matching what GStreamer/PipeWire
+/// (GNOME Camera) does.
+///
+/// This IR sensor emits strictly alternating dark/lit frames (the IR strobe
+/// is on for every second frame). With a single buffer the driver has no free
+/// buffer at the moment a frame completes, so that frame is dropped — the app
+/// then receives every *other* frame and stays locked to one parity for
+/// seconds: either all dark (no face ever) or all lit. Queuing several
+/// buffers keeps frames consecutive, so skipping the dark ones always leaves
+/// a lit one.
+const N_BUFFERS: u32 = 4;
+
+struct BufferMapping {
+    ptr: *mut c_void,
+    len: usize,
 }
 
 pub struct Camera {
     fd: OwnedFd,
-    mmap_ptr: *mut c_void,
-    length: usize,
+    bufs: Vec<BufferMapping>,
     width: u32,
     height: u32,
     stream_on: bool,
@@ -117,62 +135,85 @@ impl Camera {
         let height = pix.height;
 
         let mut reqbuf = v4l2_requestbuffers {
-            count: 1,
+            count: N_BUFFERS,
             type_: V4L2_BUF_TYPE_VIDEO_CAPTURE,
             memory: V4L2_MEMORY_MMAP,
             reserved: [0, 0],
         };
         ioctl(fd.as_raw_fd(), VIDIOC_REQBUFS, &mut reqbuf as *mut _ as *mut c_void)?;
-
-        let mut buf = v4l2_buffer {
-            index: 0,
-            type_: V4L2_BUF_TYPE_VIDEO_CAPTURE,
-            memory: V4L2_MEMORY_MMAP,
-            ..unsafe { std::mem::zeroed() }
-        };
-        ioctl(fd.as_raw_fd(), VIDIOC_QUERYBUF, &mut buf as *mut _ as *mut c_void)?;
-
-        let length = buf.length as usize;
-        let offset = buf.m as libc::off_t;
-
-        let mmap_ptr = unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                length,
-                PROT_READ,
-                MAP_SHARED,
-                fd.as_raw_fd(),
-                offset,
-            )
-        };
-        if mmap_ptr == MAP_FAILED {
-            return Err(anyhow::anyhow!("mmap failed"));
+        if std::env::var_os("FACEDIAG").is_some() {
+            eprintln!("FACEDIAG REQBUFS count={} (asked {})", reqbuf.count, N_BUFFERS);
+        }
+        if reqbuf.count == 0 {
+            return Err(anyhow::anyhow!("driver allocated no capture buffers for {}", device_path));
         }
 
-        Ok(Self { fd, mmap_ptr, length, width, height, stream_on: false })
-    }
-
-    pub fn capture_frame(&mut self, timeout_ms: i32) -> Result<IrFrame> {
-        if !self.stream_on {
-            let buf = v4l2_buffer {
-                index: 0,
+        let mut bufs = Vec::with_capacity(reqbuf.count as usize);
+        for index in 0..reqbuf.count {
+            let mut buf = v4l2_buffer {
+                index,
                 type_: V4L2_BUF_TYPE_VIDEO_CAPTURE,
                 memory: V4L2_MEMORY_MMAP,
                 ..unsafe { std::mem::zeroed() }
             };
-            ioctl(self.fd.as_raw_fd(), VIDIOC_QBUF, &buf as *const _ as *mut c_void)?;
+            ioctl(fd.as_raw_fd(), VIDIOC_QUERYBUF, &mut buf as *mut _ as *mut c_void)?;
+
+            let length = buf.length as usize;
+            let offset = buf.m as libc::off_t;
+            let ptr = unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    length,
+                    PROT_READ,
+                    MAP_SHARED,
+                    fd.as_raw_fd(),
+                    offset,
+                )
+            };
+            if ptr == MAP_FAILED {
+                return Err(anyhow::anyhow!("mmap failed for buffer {}", index));
+            }
+            bufs.push(BufferMapping { ptr, len: length });
+        }
+
+        Ok(Self { fd, bufs, width, height, stream_on: false })
+    }
+
+    pub fn capture_frame(&mut self, timeout_ms: i32) -> Result<IrFrame> {
+        if !self.stream_on {
+            // Queue every buffer before STREAMON so the driver always has a
+            // free buffer ready — a missing one costs a dropped frame.
+            for index in 0..self.bufs.len() as u32 {
+                let buf = v4l2_buffer {
+                    index,
+                    type_: V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                    memory: V4L2_MEMORY_MMAP,
+                    ..unsafe { std::mem::zeroed() }
+                };
+                if let Err(e) = ioctl(self.fd.as_raw_fd(), VIDIOC_QBUF, &buf as *const _ as *mut c_void) {
+                    if std::env::var_os("FACEDIAG").is_some() {
+                        eprintln!("FACEDIAG QBUF init index={} FAILED: {}", index, e);
+                    }
+                    return Err(e);
+                }
+                if std::env::var_os("FACEDIAG").is_some() {
+                    eprintln!("FACEDIAG QBUF init index={} ok", index);
+                }
+            }
             let stream_type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
             ioctl(self.fd.as_raw_fd(), VIDIOC_STREAMON, &stream_type as *const _ as *mut c_void)?;
             self.stream_on = true;
         }
 
         // Use poll() to wait for data with the configured timeout
+        let t_poll = Instant::now();
         let mut pfd = pollfd {
             fd: self.fd.as_raw_fd(),
             events: POLLIN,
             revents: 0,
         };
         let poll_ret = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        let poll_dt = t_poll.elapsed();
         if poll_ret < 0 {
             return Err(anyhow::anyhow!("poll failed: {}", std::io::Error::last_os_error()));
         }
@@ -187,12 +228,36 @@ impl Camera {
             ..unsafe { std::mem::zeroed() }
         };
         if ioctl(self.fd.as_raw_fd(), VIDIOC_DQBUF, &mut buf as *mut _ as *mut c_void).is_ok() {
+            let sequence = buf.sequence;
+            let index = buf.index as usize;
             let bytes_used = buf.bytesused as usize;
-            let data_slice = unsafe { std::slice::from_raw_parts(self.mmap_ptr as *const u8, bytes_used) };
-            let data = data_slice.iter().map(|&b| (b as u16) * 257).collect();
+            if std::env::var_os("FACEDIAG").is_some() {
+                eprintln!(
+                    "FACEDIAG DQ idx={} seq={} bytes={} poll={:?} revents={:#x}",
+                    buf.index, sequence, bytes_used, poll_dt, pfd.revents
+                );
+            }
 
-            let _ = ioctl(self.fd.as_raw_fd(), VIDIOC_QBUF, &mut buf as *mut _ as *mut c_void);
-            Ok(IrFrame { data, width: self.width, height: self.height })
+            let map = &self.bufs[index];
+            let n = bytes_used.min(map.len);
+            let data_slice = unsafe { std::slice::from_raw_parts(map.ptr as *const u8, n) };
+            let data: Vec<u16> = data_slice.iter().map(|&b| (b as u16) * 257).collect();
+
+            // Requeue right away so the very next frame is not dropped.
+            let qbuf = v4l2_buffer {
+                index: buf.index,
+                type_: V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                memory: V4L2_MEMORY_MMAP,
+                ..unsafe { std::mem::zeroed() }
+            };
+            if let Err(e) = ioctl(self.fd.as_raw_fd(), VIDIOC_QBUF, &qbuf as *const _ as *mut c_void) {
+                if std::env::var_os("FACEDIAG").is_some() {
+                    eprintln!("FACEDIAG QBUF requeue index={} FAILED: {}", buf.index, e);
+                }
+            } else if std::env::var_os("FACEDIAG").is_some() {
+                eprintln!("FACEDIAG QBUF requeue index={} ok", buf.index);
+            }
+            Ok(IrFrame { data, width: self.width, height: self.height, sequence })
         } else {
             Err(anyhow::anyhow!("Failed to capture frame: {}", std::io::Error::last_os_error()))
         }
@@ -210,7 +275,9 @@ impl Camera {
 impl Drop for Camera {
     fn drop(&mut self) {
         self.stop_stream();
-        unsafe { munmap(self.mmap_ptr, self.length) };
+        for b in &self.bufs {
+            unsafe { munmap(b.ptr, b.len) };
+        }
     }
 }
 

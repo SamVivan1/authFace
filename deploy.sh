@@ -79,7 +79,11 @@ else
 fi
 
 echo "Installing config..."
-install -Dm644 config/face-auth.toml.example "$CONFIG_DIR/face-auth.toml"
+if [ -f "$CONFIG_DIR/face-auth.toml" ]; then
+    echo "Config already exists at $CONFIG_DIR/face-auth.toml — keeping it (not overwritten)"
+else
+    install -Dm644 config/face-auth.toml.example "$CONFIG_DIR/face-auth.toml"
+fi
 
 # ---- PAM setup ----
 echo "Installing PAM configs..."
