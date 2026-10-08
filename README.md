@@ -9,6 +9,10 @@
 > [!NOTE]
 > This repository is a **personal fork** of [pfalkingham/authFace](https://github.com/pfalkingham/authFace). All credit for the original design and implementation goes to the upstream author. This fork adds a few personal-quality-of-life fixes documented below. See [License](#license).
 
+> [!TIP]
+> **Panduan instalasi lengkap (Bahasa Indonesia)** — install di laptop baru, distro hop,
+> install ulang, install offline, backup & restore: lihat **[INSTALL.md](INSTALL.md)**.
+
 - **Face unlock for sudo, lock screen (GNOME/Sway), and `gdm-password`**
 - **~2 seconds** from camera poll to authenticated
 - **Static musl binary** — no dependencies, no runtime
@@ -29,6 +33,12 @@ This fork cherry-picks the following improvements on top of upstream:
 | **Lock-screen compat** | Only Fedora (`pam_selinux_permit.so` insertion point) | Also handles Ubuntu/Debian `gdm-password` (`#%PAM-1.0` insertion point) |
 | **Model download** | Required `models/version-slim-320.onnx` to be present | `deploy.sh` auto-downloads it from the upstream Ultra-Light detector repo if missing |
 | **Lock screen scan indicator** | None (silent scan) | `face-auth` writes a status file; a GNOME Shell extension renders scanning/ok/fail on the lock screen |
+| **Detector input range** | feeds `[0,1]` to a model trained on `[-1,1]` — score saturates at ~0.105, below any threshold | feeds `[-1,1]`; detection now scores ~0.999 on live frames (`detector.rs`) |
+| **Capture buffers** | single mmap buffer — the IR strobe makes every other frame dark, and a lone buffer drops frames (parity lock, seconds of all-dark frames) | a ring of 4 buffers queued before `STREAMON`, requeued immediately; dark frames are skipped and their lit twin taken |
+| **Camera lifetime** | reopened per frame (preview/auth) — always captured the first post-`STREAMON` frame, which is black | camera held open and streaming, GNOME-Camera/GStreamer style; reopened only after repeated errors |
+| **Embedding input** | whole 640×360 frame squeezed into 112×112 — the embedding mostly encoded the background (same-person frames only ~0.65 cosine) | detector face box cropped to a padded square first (~0.89 cosine, min 0.85) |
+| **Embedding format** | version 1, single-shot capture in `authenticate_once` | version 2 (rejects stale v1 files); auth runs a retrying scan window and reports `No face detected` distinctly from `no match` |
+| **Config on redeploy** | `/etc/face-auth.toml` overwritten every `deploy.sh` run | existing config is kept (pinned `device` survives redeploys) |
 
 ## Features
 
@@ -42,6 +52,9 @@ This fork cherry-picks the following improvements on top of upstream:
 - **Works on immutable distros** — no `rpm-ostree layer`, no package installs, no `/usr` modification
 
 ## Quick Start
+
+> Full walkthrough (prerequisites per distro, offline installs, backup/restore on
+> distro hop, troubleshooting): **[INSTALL.md](INSTALL.md)**.
 
 ```bash
 # 1. Install core authentication (PAM, models, binaries)
@@ -167,7 +180,7 @@ sudo ./deploy.sh
 | Binaries | Installs to `/usr/local/bin` | `face-auth` + `face-enroll` |
 | Detection model | Downloads `version-slim-320.onnx` if missing | From Ultra-Light-Fast-Generic-Face-Detector-1MB upstream |
 | Recog. model | Downloads from InsightFace | `w600k_mbf.onnx` (~13 MB) to `/usr/local/share/face-auth/` |
-| Config | Installs default config | `/etc/face-auth.toml` |
+| Config | Installs default config **only if absent** (never overwrites) | `/etc/face-auth.toml` |
 | PAM | Patches PAM service files | Adds `sufficient` `pam_exec.so quiet` to `sudo`, `gdm-password`, `swaylock` |
 | SELinux | Compiles and loads policy | Allows `xdm_t` to mmap camera for lock-screen auth |
 | Storage | Creates embeddings directory | `/var/lib/face-auth/<user>/` with sticky bit |
@@ -243,6 +256,11 @@ CLI options: `--frames`, `--interval`, `--device`, `--threshold`, `--model`, `--
 
 The GUI's **Enroll Face** button replaces embeddings; **Improve Matching** appends to them.
 
+> **Embedding format v2:** embeddings are cropped to the detected face before
+> encoding. Files written by older builds (v1) are rejected with
+> *"Embeddings were made by an older version — re-enroll"* — simply run
+> `face-enroll --user $USER -f 8` once after upgrading. Do not mix v1 and v2 files.
+
 ## PAM Integration
 
 The deploy script adds a `sufficient` `pam_exec.so quiet` line to:
@@ -306,11 +324,13 @@ PAM (sudo / gdm-password / swaylock)
   ▼
 face-auth (static binary)
   ├─ Resolve PAM_USER → per-user config (fork: getent passwd)
-  ├─ V4L2 capture from IR camera (640×400 GREY, auto-detected /dev/videoN)
+  ├─ V4L2 capture from IR camera (GREY, auto-detected /dev/videoN)
+  │   ├─ ring of 4 mmap buffers queued before STREAMON (no dropped frames)
+  │   ├─ skip dark strobe frames — grab the lit one already queued
   │   └─ poll() with 5s timeout — exits cleanly if camera hangs
   ├─ Histogram equalization
-  ├─ Face detection (RetinaFace-derived ONNX model)
-  ├─ Resize to 112×112, normalize to [-1, 1]
+  ├─ Face detection (Ultra-Light ONNX model, [-1, 1] input range)
+  ├─ Crop detector box to a padded square, resize to 112×112, normalize to [-1, 1]
   ├─ tract-onnx inference (MobileFaceNet, 512-d embedding)
   ├─ Cosine similarity vs stored embeddings (default threshold 0.6)
   └─ Exit 0 (match) or exit 1 (no match → password prompt)
@@ -356,7 +376,13 @@ ls /sys/class/video4linux/*/name
 sudo usermod -aG video $USER
 
 # Debug output
-RUST_LOG=face_auth_core=debug sudo -k && sudo true
+sudo env PAM_USER=$USER USER=$USER HOME=$HOME RUST_LOG=face_auth_core=debug /usr/local/bin/face-auth
+
+# Low-level diagnostics: camera buffers, detection boxes, per-frame timing
+FACEDIAG=1 sudo -E env PAM_USER=$USER USER=$USER HOME=$HOME /usr/local/bin/face-auth
+
+# Analyse N frames (content/dark ratio, detector score, cosine similarity, face box)
+cargo run --release -p face-auth-core --example diag -- --frames 20
 
 # Check PAM logs
 journalctl | grep -i "pam_exec\|face-auth"
@@ -378,11 +404,31 @@ face-auth-gtk    # run from terminal to see errors
 ### Multi-camera picks the wrong device / no device selected
 
 ```bash
-# See which IR device is detected
-sudo env PAM_USER=$USER face-auth -v
+# See which IR device is detected (names of all video nodes)
+for d in /sys/class/video4linux/*; do echo "$(basename $d): $(cat $d/name)"; done
 
 # Pin a specific camera in per-user config
 echo 'device = "/dev/video2"' >> ~/.config/face-auth.toml
+# ...or just use the camera picker in the GUI
+```
+
+### "Embeddings were made by an older version — re-enroll"
+
+The embedding file format is versioned. `embeddings.bin` written by an older build
+(including v1 whole-frame embeddings) is rejected rather than silently mixed:
+
+```bash
+face-enroll --user $USER -f 8 -v     # replaces with a fresh, v2-format set
+```
+
+### Preview is black / unlock works only sometimes
+
+Both were capture-side bugs (single mmap buffer + per-frame camera reopen) and are
+fixed in this build. If it still happens, check that the pinned `device` is the **IR**
+node (name contains `IR`), not the RGB or metadata node, and inspect a few frames:
+
+```bash
+cargo run --release -p face-auth-core --example diag -- --frames 20
 ```
 
 ## Security & Limitations
