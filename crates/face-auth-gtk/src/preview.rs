@@ -1,14 +1,23 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use face_auth_core::capture::{Camera, IrFrame};
-use face_auth_core::detector::{raw_frame_has_content, FaceDetector};
+use face_auth_core::detector::{assess_frame, FaceDetector, FrameQuality};
 use face_auth_core::preprocess::histogram_equalize;
 
-#[derive(Clone)]
+/// Cap how long a single capture may block, so switching camera or pressing
+/// Enrol does not wait out the full authentication timeout.
+const PREVIEW_CAPTURE_TIMEOUT_MS: i32 = 400;
+/// Pause before retrying after the camera goes away (unplugged, or in use).
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+/// Run face detection at most this often. The preview itself streams at the
+/// camera's own rate; inference every frame would peg a core for no visible
+/// benefit, since the badge only has to keep up with a person moving.
+const DETECT_INTERVAL: Duration = Duration::from_millis(150);
+
 pub struct PreviewFrame {
     pub data: Vec<u8>,
     pub width: i32,
@@ -16,37 +25,35 @@ pub struct PreviewFrame {
     pub face_detected: bool,
 }
 
+pub enum PreviewEvent {
+    Frame(PreviewFrame),
+    /// Camera unavailable — carries a message worth showing the user.
+    Unavailable(String),
+}
+
 pub struct CaptureController {
     shutdown: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
-    sender: mpsc::Sender<PreviewFrame>,
-    pub receiver: mpsc::Receiver<PreviewFrame>,
+    sender: SyncSender<PreviewEvent>,
+    pub receiver: mpsc::Receiver<PreviewEvent>,
     device: String,
-    model_path: String,
     detector_model: String,
     detector_threshold: f32,
-    capture_timeout: i32,
 }
 
 impl CaptureController {
-    pub fn new(
-        model_path: &str,
-        detector_model: &str,
-        detector_threshold: f32,
-        device: &str,
-        capture_timeout: i32,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel();
+    pub fn new(detector_model: &str, detector_threshold: f32, device: &str) -> Self {
+        // Depth 1 with try_send: the UI redraws at its own pace, and a queue
+        // that grows faster than it drains only buys latency and memory.
+        let (tx, rx) = mpsc::sync_channel(1);
         Self {
             shutdown: Arc::new(AtomicBool::new(false)),
             thread: None,
             sender: tx,
             receiver: rx,
             device: device.to_string(),
-            model_path: model_path.to_string(),
             detector_model: detector_model.to_string(),
             detector_threshold,
-            capture_timeout,
         }
     }
 
@@ -56,89 +63,18 @@ impl CaptureController {
     }
 
     pub fn start(&mut self) {
+        if self.thread.is_some() {
+            return;
+        }
         self.shutdown.store(false, Ordering::Relaxed);
         let shutdown = self.shutdown.clone();
         let tx = self.sender.clone();
         let device = self.device.clone();
-        let model_path = self.model_path.clone();
         let detector_model = self.detector_model.clone();
         let detector_threshold = self.detector_threshold;
-        let capture_timeout = self.capture_timeout;
 
         self.thread = Some(thread::spawn(move || {
-            let _ = &model_path;
-            let mut detector = match FaceDetector::new(&detector_model, detector_threshold) {
-                Ok(d) => d,
-                Err(_) => return,
-            };
-
-            // The camera is opened once and left streaming, the way GNOME
-            // Camera/GStreamer does it. Re-opening per frame (what this used
-            // to do) always captured the first frame after STREAMON, and that
-            // one is always black: the IR emitter needs a beat to come up and
-            // the sensor alternates dark/lit frames — hence a black preview.
-            let mut camera: Option<Camera> = None;
-            let mut errors = 0u32;
-            let mut frame_idx: u32 = 0;
-            let mut face_detected = false;
-
-            loop {
-                if shutdown.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                if camera.is_none() {
-                    match Camera::open(&device) {
-                        Ok(c) => {
-                            camera = Some(c);
-                            errors = 0;
-                        }
-                        Err(e) => {
-                            eprintln!("preview: {}", e);
-                            thread::sleep(Duration::from_millis(100));
-                            continue;
-                        }
-                    }
-                }
-
-                let frame = match camera.as_mut().unwrap().capture_frame(capture_timeout) {
-                    Ok(f) => {
-                        errors = 0;
-                        f
-                    }
-                    Err(e) => {
-                        errors += 1;
-                        eprintln!("preview: capture error — {}", e);
-                        if errors >= 3 {
-                            camera = None;
-                        }
-                        thread::sleep(Duration::from_millis(100));
-                        continue;
-                    }
-                };
-
-                // Dark strobe frame: its lit twin is already queued, take it.
-                if !raw_frame_has_content(&frame) {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-
-                let mut frame = frame;
-                histogram_equalize(&mut frame);
-
-                // Detection only: the preview indicator means "a face is in
-                // view", so encoding the frame here bought nothing and doubled
-                // the per-frame cost. It is also the expensive part (~100ms of
-                // tract inference), so it runs on every third frame to keep the
-                // preview near the sensor's own frame rate.
-                frame_idx = frame_idx.wrapping_add(1);
-                if frame_idx % 3 == 1 {
-                    face_detected = detector.detect(&frame).unwrap_or(false);
-                }
-
-                send_preview(&tx, &frame, face_detected);
-                thread::sleep(Duration::from_millis(50));
-            }
+            capture_loop(shutdown, tx, device, detector_model, detector_threshold);
         }));
     }
 
@@ -147,6 +83,8 @@ impl CaptureController {
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
+        // Discard anything queued so a restart does not show a stale frame.
+        while self.receiver.try_recv().is_ok() {}
     }
 
     fn restart(&mut self) {
@@ -161,14 +99,107 @@ impl Drop for CaptureController {
     }
 }
 
-fn send_preview(tx: &mpsc::Sender<PreviewFrame>, frame: &IrFrame, face_detected: bool) {
-    let data = frame_to_rgba(frame);
-    let _ = tx.send(PreviewFrame {
-        data,
+fn capture_loop(
+    shutdown: Arc<AtomicBool>,
+    tx: SyncSender<PreviewEvent>,
+    device: String,
+    detector_model: String,
+    detector_threshold: f32,
+) {
+    let mut detector = match FaceDetector::new(&detector_model, detector_threshold) {
+        Ok(d) => d,
+        Err(e) => {
+            let _ = tx.try_send(PreviewEvent::Unavailable(format!(
+                "face detector unavailable: {e}"
+            )));
+            return;
+        }
+    };
+
+    // The camera is opened once and held. Reopening per frame meant a full
+    // open/G_FMT/REQBUFS/QUERYBUF/mmap/STREAMON cycle around twenty times a
+    // second, which is most of what made the preview feel sluggish.
+    let mut camera: Option<Camera> = None;
+    let mut last_detect = Instant::now() - DETECT_INTERVAL;
+    let mut face_detected = false;
+
+    while !shutdown.load(Ordering::Relaxed) {
+        if camera.is_none() {
+            match Camera::open(&device) {
+                Ok(c) => camera = Some(c),
+                Err(e) => {
+                    let _ = tx.try_send(PreviewEvent::Unavailable(format!("{e}")));
+                    sleep_interruptible(&shutdown, RETRY_DELAY);
+                    continue;
+                }
+            }
+        }
+
+        // Paired capture: this sensor strobes its illuminator, so every other
+        // frame is near-black. Showing those made the preview flicker between a
+        // real image and an equalised noise field.
+        let captured = camera
+            .as_mut()
+            .expect("camera opened just above")
+            .capture_illuminated_frame(PREVIEW_CAPTURE_TIMEOUT_MS);
+
+        let frame = match captured {
+            Ok(f) => f,
+            Err(e) => {
+                // Drop the handle so the next iteration reopens the device.
+                camera = None;
+                face_detected = false;
+                let _ = tx.try_send(PreviewEvent::Unavailable(format!("{e}")));
+                sleep_interruptible(&shutdown, RETRY_DELAY);
+                continue;
+            }
+        };
+
+        let quality = assess_frame(&frame);
+        if quality != FrameQuality::Ok {
+            face_detected = false;
+            // Show the raw frame, never an equalised one: equalising a dark
+            // frame is exactly what produced the grey mess.
+            let _ = tx.try_send(PreviewEvent::Unavailable(format!("{quality}")));
+            continue;
+        }
+
+        let mut frame = frame;
+        histogram_equalize(&mut frame);
+
+        if last_detect.elapsed() >= DETECT_INTERVAL {
+            // Detection alone answers "is there a face". The old code also ran
+            // the full 512-d encoder here and threw the embedding away.
+            face_detected = detector.detect(&frame).unwrap_or(false);
+            last_detect = Instant::now();
+        }
+
+        send(&tx, &frame, face_detected);
+    }
+}
+
+/// Sleep in slices so shutdown is noticed promptly.
+fn sleep_interruptible(shutdown: &AtomicBool, total: Duration) {
+    let step = Duration::from_millis(50);
+    let mut left = total;
+    while !left.is_zero() && !shutdown.load(Ordering::Relaxed) {
+        let nap = step.min(left);
+        thread::sleep(nap);
+        left -= nap;
+    }
+}
+
+fn send(tx: &SyncSender<PreviewEvent>, frame: &IrFrame, face_detected: bool) {
+    let event = PreviewEvent::Frame(PreviewFrame {
+        data: frame_to_rgba(frame),
         width: frame.width as i32,
         height: frame.height as i32,
         face_detected,
     });
+    // Drop this frame rather than block if the UI has not taken the last one.
+    match tx.try_send(event) {
+        Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {}
+    }
 }
 
 fn frame_to_rgba(frame: &IrFrame) -> Vec<u8> {
@@ -177,13 +208,8 @@ fn frame_to_rgba(frame: &IrFrame) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(w * h * 4);
     for y in 0..h {
         for x in 0..w {
-            let idx = y * w + x;
-            let pixel = frame.data.get(idx).copied().unwrap_or(0);
-            let v = (pixel >> 8) as u8;
-            rgba.push(v);
-            rgba.push(v);
-            rgba.push(v);
-            rgba.push(255);
+            let v = frame.data.get(y * w + x).map_or(0, |&p| (p >> 8) as u8);
+            rgba.extend_from_slice(&[v, v, v, 255]);
         }
     }
     rgba

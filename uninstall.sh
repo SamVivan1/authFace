@@ -16,8 +16,8 @@ if [ -n "${SUDO_USER:-}" ]; then
     ACTUAL_USER="$SUDO_USER"
     ACTUAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
 else
-    ACTUAL_USER="$USER"
-    ACTUAL_HOME="$HOME"
+    ACTUAL_USER="${USER:-$(id -un)}"
+    ACTUAL_HOME="${HOME:-$(getent passwd "$ACTUAL_USER" | cut -d: -f6)}"
 fi
 
 # ---- Check if /usr is writable (immutable FS detection) ----
@@ -81,13 +81,15 @@ rm -rf "$GUI_DATA_DIR"
 rm -rf "${XDG_DATA_HOME:-$ACTUAL_HOME/.local/share}/face-auth-gtk"
 
 echo "Restoring PAM configs..."
-for service in sudo swaylock gdm-password; do
+for service in sudo swaylock; do
     conf="$PAM_DIR/$service"
     if [ -f "$conf.face-auth.bak" ]; then
         mv "$conf.face-auth.bak" "$conf"
         echo "Restored $conf from backup"
     else
-        sed -i '/face-auth/d' "$conf" 2>/dev/null || true
+        # Anchored to our own stanza: a bare /face-auth/d would delete any
+        # unrelated line that happens to mention it.
+        sed -i '/pam_exec\.so.*face-auth/d' "$conf" 2>/dev/null || true
         echo "Cleaned $conf"
     fi
 done

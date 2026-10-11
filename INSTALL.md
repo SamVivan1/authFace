@@ -219,7 +219,7 @@ Apa yang dilakukan script ini:
 | Model deteksi | Download `version-slim-320.onnx` jika belum ada (≈1.2 MB) |
 | Model pengenalan | Download `w600k_mbf.onnx` dari InsightFace + verifikasi SHA-256 (≈13 MB) |
 | Config | Install `/etc/face-auth.toml` **hanya jika belum ada** (config lama tidak ditimpa) |
-| PAM | Tambah baris `auth sufficient pam_exec.so quiet /usr/local/bin/face-auth` ke `sudo`, `gdm-password`, `swaylock` |
+| PAM | Tambah baris `auth sufficient pam_exec.so quiet /usr/local/bin/face-auth` ke `sudo` dan `swaylock` |
 | SELinux | Compile + load policy `face_auth` (khusus Fedora/derivatif) |
 | Storage | Bikin `/var/lib/face-auth/<user>/` (sticky bit, boleh ditulis user) |
 
@@ -503,7 +503,7 @@ cargo run --release -p face-auth-core --example diag -- --frames 20
 journalctl | grep -i "pam_exec\|face-auth"
 
 # 6. Cek apakah PAM sudah terpasang
-grep face-auth /etc/pam.d/sudo /etc/pam.d/gdm-password /etc/pam.d/swaylock
+grep face-auth /etc/pam.d/sudo /etc/pam.d/swaylock
 
 # 7. Cek embeddings tersimpan
 ls -la /var/lib/face-auth/$USER/
@@ -513,8 +513,8 @@ ls -la /var/lib/face-auth/$USER/
 
 ```bash
 sudo cp /etc/pam.d/sudo.face-auth.bak /etc/pam.d/sudo
-sudo cp /etc/pam.d/gdm-password.face-auth.bak /etc/pam.d/gdm-password
-sudo cp /etc/pam.d/swaylock.face-auth.bak /etc/pam.d/swaylock
+# (tidak lagi dipasang ke gdm-password; opsional restore manual jika perlu)
+test -f /etc/pam.d/swaylock.face-auth.bak && sudo cp /etc/pam.d/swaylock.face-auth.bak /etc/pam.d/swaylock || true
 # atau sekalian: sudo ./uninstall.sh
 ```
 

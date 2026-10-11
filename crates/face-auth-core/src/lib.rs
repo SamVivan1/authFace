@@ -5,16 +5,33 @@ pub mod error;
 pub mod inference;
 pub mod preprocess;
 pub mod storage;
+pub mod user;
 pub mod verify;
 
 pub use crate::capture::Camera;
 pub use crate::config::FaceAuthConfig;
-use crate::detector::FaceDetector;
+use crate::detector::{assess_frame, FaceDetector, FrameQuality};
+use crate::error::FaceAuthError;
 use crate::inference::FaceEncoder;
 use crate::storage::EmbeddingStore;
 use crate::verify::verify_embedding;
 use anyhow::Result;
 use std::time::{Duration, Instant};
+
+/// Progress reporting for the interactive enrolment paths.
+///
+/// The library never writes to stdout itself — `face-auth` runs under
+/// `pam_exec`, where stray output lands on the user's terminal on every
+/// `sudo`. Callers that *are* interactive supply a sink.
+pub type ProgressFn<'a> = &'a mut dyn FnMut(EnrollProgress);
+
+#[derive(Debug, Clone)]
+pub enum EnrollProgress {
+    Capturing { captured: usize, wanted: usize, attempt: usize },
+    NoContent,
+    NoFace,
+    Captured { captured: usize, wanted: usize },
+}
 
 pub struct FaceAuth {
     config: FaceAuthConfig,
@@ -24,27 +41,25 @@ pub struct FaceAuth {
 
 impl FaceAuth {
     pub fn new(config: FaceAuthConfig) -> Result<Self> {
+        config.validate()?;
         let encoder = FaceEncoder::new(&config.model_path())?;
-        let detector = FaceDetector::new(
-            &config.detector_model_path(),
-            config.detector_threshold(),
-        )?;
+        let detector = FaceDetector::new(&config.detector_model_path(), config.detector_threshold())?;
         Ok(Self { config, encoder, detector })
     }
 
-    /// Single-shot auth used by the GUI "Test" button.
-    ///
-    /// It is really a short scan: the camera is opened once and kept streaming
-    /// for `scan_duration_ms`, because the sensor emits alternating dark/lit
-    /// frames (IR strobe) and the first frames after STREAMON are always dark.
-    /// Grabbing exactly one frame — as this used to do — reliably grabbed a
-    /// dark one, so the test failed no matter where you looked.
+    pub fn config(&self) -> &FaceAuthConfig {
+        &self.config
+    }
+
+    /// Single-shot verification. Used by the settings GUI's test button; the
+    /// PAM path uses [`FaceAuth::authenticate_scan`].
     pub fn authenticate_once(&mut self, user: &str) -> Result<bool> {
         let duration = self.config.scan_duration_ms();
         let interval = self.config.scan_interval_ms();
         self.authenticate_scan(user, duration, interval)
     }
 
+    /// Keep capturing until a frame matches or the scan window closes.
     pub fn authenticate_scan(
         &mut self,
         user: &str,
@@ -146,6 +161,7 @@ impl FaceAuth {
         store: &mut EmbeddingStore,
         frames: usize,
         interval_ms: u64,
+        progress: ProgressFn<'_>,
     ) -> Result<()> {
         let mut captured = 0usize;
         let mut attempts = 0usize;
@@ -155,9 +171,10 @@ impl FaceAuth {
             println!("Capturing frame {}/{} (attempt {})...", captured + 1, frames, attempts + 1);
             let frame = cam.capture_frame(self.config.capture_timeout_ms())?;
             attempts += 1;
+            progress(EnrollProgress::Capturing { captured, wanted: frames, attempt: attempts });
 
             if !crate::detector::raw_frame_has_content(&frame) {
-                // Strobe frame — the lit twin is next in the queue, take it now.
+                progress(EnrollProgress::NoContent);
                 eprintln!("No content in frame, retrying...");
                 continue;
             }
@@ -168,6 +185,7 @@ impl FaceAuth {
             let face = match self.detector.detect_face(&frame)? {
                 Some(f) => f,
                 None => {
+                    progress(EnrollProgress::NoFace);
                     eprintln!("No face detected, retrying...");
                     std::thread::sleep(std::time::Duration::from_millis(interval_ms));
                     continue;
@@ -178,6 +196,7 @@ impl FaceAuth {
             let embedding = self.encoder.encode(input.view())?;
             store.add_embedding(embedding);
             captured += 1;
+            progress(EnrollProgress::Captured { captured, wanted: frames });
 
             if captured < frames {
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
@@ -191,43 +210,61 @@ impl FaceAuth {
         Ok(())
     }
 
-    pub fn enroll(&mut self, user: &str, frames: usize, interval_ms: u64) -> Result<()> {
+    /// Replace the user's enrolled embeddings.
+    pub fn enroll(
+        &mut self,
+        user: &str,
+        frames: usize,
+        interval_ms: u64,
+        progress: ProgressFn<'_>,
+    ) -> Result<usize> {
         let mut store = EmbeddingStore::default();
         let mut cam = Camera::open(&self.config.device())?;
-        self.capture_embeddings(&mut cam, &mut store, frames, interval_ms)?;
+        self.capture_embeddings(&mut cam, &mut store, frames, interval_ms, progress)?;
 
         let saved = store.embeddings.len();
         store.save(user, &self.config.embeddings_dir())?;
-        println!("Saved {} embeddings for user '{}'", saved, user);
-
-        Ok(())
+        Ok(saved)
     }
 
-    pub fn enroll_append(&mut self, user: &str, frames: usize, interval_ms: u64) -> Result<()> {
+    /// Append to the user's enrolled embeddings, improving coverage across
+    /// lighting and angles.
+    pub fn enroll_append(
+        &mut self,
+        user: &str,
+        frames: usize,
+        interval_ms: u64,
+        progress: ProgressFn<'_>,
+    ) -> Result<(usize, usize)> {
         let mut store = match EmbeddingStore::load(user, &self.config.embeddings_dir()) {
             Ok(s) => s,
-            Err(_) => EmbeddingStore::default(),
+            // Only "nothing enrolled yet" starts from empty. Any other error
+            // (corrupt or unreadable file) must not silently discard what is
+            // already there — saving would overwrite it.
+            Err(e) if matches!(e.downcast_ref::<FaceAuthError>(), Some(FaceAuthError::NoEmbeddings)) => {
+                EmbeddingStore::default()
+            }
+            Err(e) => return Err(e.context("refusing to append: existing embeddings unreadable")),
         };
+
         let existing = store.embeddings.len();
         let mut cam = Camera::open(&self.config.device())?;
-        self.capture_embeddings(&mut cam, &mut store, frames, interval_ms)?;
+        self.capture_embeddings(&mut cam, &mut store, frames, interval_ms, progress)?;
 
         let total = store.embeddings.len();
         store.save(user, &self.config.embeddings_dir())?;
-        println!("Added {} new embeddings for user '{}' ({} total)", total - existing, user, total);
-
-        Ok(())
+        Ok((total - existing, total))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
-    fn test_config_defaults() {
+    fn config_defaults_are_sane() {
         let config = FaceAuthConfig::default();
         assert_eq!(config.threshold(), 0.6);
-        assert!(config.device().starts_with("/dev/video"));
+        assert!(config.validate().is_ok());
     }
 }

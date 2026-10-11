@@ -4,6 +4,72 @@ use tract_ndarray::s;
 
 use crate::capture::IrFrame;
 
+// Frame-quality gates
+const MIN_FRAME_MEAN_8BIT: f64 = 12.0;
+const MIN_FRAME_VARIANCE_8BIT: f64 = 20.0;
+const U16_PER_8BIT: f64 = 257.0;
+
+/// Why a frame was rejected before inference.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FrameQuality {
+    Ok,
+    Empty,
+    /// Almost certainly an unlit frame from a strobing IR illuminator.
+    TooDark { mean_8bit: f64 },
+    /// Uniform field — a covered lens, or a wall.
+    TooFlat { variance_8bit: f64 },
+}
+
+impl std::fmt::Display for FrameQuality {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FrameQuality::Ok => write!(f, "ok"),
+            FrameQuality::Empty => write!(f, "empty frame"),
+            FrameQuality::TooDark { mean_8bit } => write!(
+                f,
+                "too dark (mean {mean_8bit:.1}/255, need {MIN_FRAME_MEAN_8BIT})                  — unlit frame, or the IR illuminator is not firing"
+            ),
+            FrameQuality::TooFlat { variance_8bit } => write!(
+                f,
+                "too flat (variance {variance_8bit:.1}, need {MIN_FRAME_VARIANCE_8BIT})                  — lens covered, or nothing in view"
+            ),
+        }
+    }
+}
+
+
+/// Cheap "is this frame worth running inference on" check.
+pub fn assess_frame(frame: &IrFrame) -> FrameQuality {
+    if frame.data.is_empty() {
+        return FrameQuality::Empty;
+    }
+    let len = frame.data.len() as f64;
+    let mean = frame.data.iter().map(|&v| v as f64).sum::<f64>() / len;
+    let variance: f64 = frame
+        .data
+        .iter()
+        .map(|&v| {
+            let d = v as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / len;
+    let mean_8bit = mean / U16_PER_8BIT;
+    let variance_8bit = variance / (U16_PER_8BIT * U16_PER_8BIT);
+    if mean_8bit < MIN_FRAME_MEAN_8BIT {
+        return FrameQuality::TooDark { mean_8bit };
+    }
+    if variance_8bit < MIN_FRAME_VARIANCE_8BIT {
+        return FrameQuality::TooFlat { variance_8bit };
+    }
+    FrameQuality::Ok
+}
+
+pub fn raw_frame_has_content(frame: &IrFrame) -> bool {
+    assess_frame(frame) == FrameQuality::Ok
+}
+
+
 pub struct FaceDetector {
     model: InferenceSimplePlan<InferenceModel>,
     threshold: f32,
@@ -107,16 +173,7 @@ pub struct FaceRect {
     pub y2: f32,
 }
 
-pub fn raw_frame_has_content(frame: &IrFrame) -> bool {
-    if frame.data.is_empty() {
-        return false;
-    }
-    let len = frame.data.len() as f32;
-    let sum: f64 = frame.data.iter().map(|&v| v as f64).sum();
-    let mean = (sum / len as f64) as f32;
-    let variance: f32 = frame.data.iter().map(|&v| { let d = (v as f32) - mean; d * d }).sum::<f32>() / len;
-    variance > 100_000.0
-}
+
 
 fn preprocess_for_detector(frame: &IrFrame, lo: f32, hi: f32) -> anyhow::Result<tract_ndarray::Array3<f32>> {
     let width = frame.width as u32;
